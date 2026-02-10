@@ -2,178 +2,15 @@ import os
 import sys
 import json
 import re
+import time
+import random
 import argparse
+from urllib.parse import urljoin, urlparse
+
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-
-# =========================
-# AGENT UPGRADES (A,B,C,D,E)
-# =========================
-import time
-import random
-from urllib.parse import urljoin, urlparse
-
-def required_bullets_from_task(task: str):
-    """
-    Detect "in N bullets" / "exactly N bullets" / "N bullets" requirements.
-    Returns int or None.
-    """
-    t = (task or "").lower()
-    patterns = [
-        r'exactly\s+(\d+)\s+bullets?',
-        r'in\s+(\d+)\s+bullets?',
-        r'(\d+)\s+bullets?'
-    ]
-    for pat in patterns:
-        m = re.search(pat, t)
-        if m:
-            try:
-                return int(m.group(1))
-            except:
-                pass
-    return None
-
-def count_bullets(text: str):
-    return sum(1 for line in (text or "").splitlines() if line.lstrip().startswith("- "))
-
-def normalize_url(u: str):
-    u = (u or "").strip().strip('"').strip("'")
-    if not u:
-        return u
-    if u.startswith("//"):
-        return "https:" + u
-    if not re.match(r"^https?://", u, re.I):
-        u = "https://" + u
-    return u
-
-def extract_tool_call(reply: str):
-    """
-    (B) Robust tool-call parsing.
-    Accepts:
-      - TOOL.web_get(https://x.com)
-      - TOOL.web_get(url=https://x.com)
-      - TOOL.web_get("https://x.com")
-      - tool: web_get https://x.com
-      - web_get https://x.com
-    Returns: ("web_get", url) or (None, None)
-    """
-    txt = (reply or "").strip()
-
-    # TOOL.web_get(...)
-    m = re.search(r"TOOL\.web_get\s*\(\s*(?:url\s*=\s*)?([^\)\n]+)\)", txt, re.I)
-    if m:
-        u = m.group(1).strip().rstrip(",")
-        return ("web_get", normalize_url(u))
-
-    # tool: web_get https://...
-    m = re.search(r"\btool\s*:\s*web_get\b\s+(\S+)", txt, re.I)
-    if m:
-        return ("web_get", normalize_url(m.group(1)))
-
-    # plain: web_get https://...
-    m = re.search(r"\bweb_get\b\s+(\S+)", txt, re.I)
-    if m:
-        return ("web_get", normalize_url(m.group(1)))
-
-    return (None, None)
-
-def truncate_for_model(text: str, limit: int):
-    if not text:
-        return text
-    return text if len(text) <= limit else (text[:limit] + "\n...[truncated]...")
-
-def truncate_for_print(text: str, limit: int):
-    if not text:
-        return text
-    return text if len(text) <= limit else (text[:limit] + "\n...[truncated for print]...")
-
-def looks_like_html(s: str):
-    if not s:
-        return False
-    head = s.lstrip()[:200].lower()
-    return "<html" in head or "<!doctype" in head or "<head" in head
-
-def html_to_structured_json(html: str, base_url: str, max_chars: int = 18000):
-    """
-    (C,D) Convert HTML -> JSON-ish dict string: title, headings, text, links.
-    Requires beautifulsoup4 installed.
-    """
-    try:
-        from bs4 import BeautifulSoup
-    except Exception as e:
-        return {"error": f"BeautifulSoup missing: {e}", "url": base_url}
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # drop noisy tags
-    for tag in soup(["script", "style", "noscript"]):
-        try:
-            tag.decompose()
-        except:
-            pass
-
-    title = ""
-    if soup.title and soup.title.string:
-        title = soup.title.string.strip()
-
-    headings = []
-    for h in soup.find_all(["h1", "h2", "h3"]):
-        t = (h.get_text(" ", strip=True) or "").strip()
-        if t:
-            headings.append(t)
-        if len(headings) >= 30:
-            break
-
-    # collect links (absolute)
-    links = []
-    for a in soup.find_all("a"):
-        href = a.get("href")
-        if not href:
-            continue
-        href = href.strip()
-        # skip anchors & mailto & javascript
-        if href.startswith("#") or href.lower().startswith("mailto:") or href.lower().startswith("javascript:"):
-            continue
-        abs_url = urljoin(base_url, href)
-        # keep only http(s)
-        if urlparse(abs_url).scheme in ("http", "https"):
-            links.append(abs_url)
-        if len(links) >= 50:
-            break
-
-    text = soup.get_text(separator="\n")
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-    clean = "\n".join(lines)
-    clean = clean[:max_chars]
-
-    return {
-        "url": base_url,
-        "title": title,
-        "headings": headings,
-        "links": links,
-        "text": clean,
-    }
-
-def web_get_with_retries(url: str, timeout: int = 20, retries: int = 3, backoff: float = 0.7, headers=None):
-    """
-    (E) retries + backoff + clearer errors
-    """
-    import requests
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.get(url, timeout=timeout, headers=headers or {"User-Agent": "simple-agent"})
-            r.raise_for_status()
-            return r.text, None
-        except Exception as e:
-            last_err = e
-            if attempt < retries:
-                sleep_s = backoff * (2 ** (attempt - 1)) + random.random() * 0.2
-                time.sleep(sleep_s)
-    return None, str(last_err)
-
+from simple_agent.core import extract_url, guess_url, summarize_html
 
 
 # =========================
@@ -186,9 +23,7 @@ MODEL_DEFAULT = "gpt-4.1-mini"
 MAX_STEPS_DEFAULT = 12
 MAX_TOOL_CALLS_DEFAULT = 2
 
-# Keep tool output small when feeding back to model (stability + cost)
 TOOL_RESULT_LIMIT_FOR_MODEL_DEFAULT = 3000
-# Keep tool output snippet short if you ever print it (we mostly don't)
 TOOL_RESULT_LIMIT_FOR_PRINT_DEFAULT = 400
 
 USER_AGENT = "simple-agent"
@@ -201,8 +36,15 @@ Process:
 1. Think briefly.
 2. If needed, respond exactly with TOOL:web_get(<url>) or TOOL:web_get(url=<url>).
 3. After tool result, continue reasoning.
-4. When finished, reply starting with FINAL: (start of line)
+4. When finished, reply with:
 
+FINAL ANSWER:
+- bullet 1
+- bullet 2
+
+IMPORTANT:
+- The FINAL marker must be at the start of a line: "FINAL:" or "FINAL ANSWER:"
+- Use hyphen bullets ("- ").
 Keep reasoning short.
 """
 
@@ -226,98 +68,58 @@ def save_json(path: str, data):
 
 
 # =========================
-# Cache + Memory
+# Bullet helpers
+# =========================
+def required_bullets_from_task(task: str):
+    """
+    Detect "in N bullets" / "exactly N bullets" / "N bullets" requirements.
+    Returns int or None.
+    """
+    t = (task or "").lower()
+    patterns = [
+        r"exactly\s+(\d+)\s+bullets?",
+        r"in\s+(\d+)\s+bullets?",
+        r"(\d+)\s+bullets?",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    return None
+
+
+def count_bullets(text: str) -> int:
+    return sum(1 for line in (text or "").splitlines() if line.lstrip().startswith("- "))
+
+
+# =========================
+# String helpers
 # =========================
 def normalize_url(url: str) -> str:
-    url = (url or "").strip()
+    url = (url or "").strip().strip('"').strip("'")
     if not url:
         return url
-    if not url.lower().startswith(("http://", "https://")):
+    if url.startswith("//"):
+        return "https:" + url
+    if not re.match(r"^https?://", url, re.I):
         url = "https://" + url
     return url
 
 
-from bs4 import BeautifulSoup
-import requests
-
-
-from bs4 import BeautifulSoup
-import requests
-
-def web_get(url: str, cache=None, cache_file=None, use_cache: bool=True) -> str:
-    if url in WEB_CACHE:
-        return WEB_CACHE[url]
-
-    r = requests.get(url, timeout=20, headers={"User-Agent": "simple-agent"})
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    # Remove junk
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-
-    text = soup.get_text(separator="\n")
-
-    # Normalize whitespace
-    lines = [l.strip() for l in text.splitlines()]
-    clean = "\n".join(l for l in lines if l)
-
-    # Truncate so model doesn’t drown
-    clean = clean[:12000]
-
-    WEB_CACHE[url] = clean
-    save_cache(WEB_CACHE)
-    return clean
-
-    r = requests.get(url, timeout=20, headers={"User-Agent": "simple-agent"})
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    # Remove junk
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-
-    text = soup.get_text(separator="\n")
-
-    # Normalize whitespace
-    lines = [l.strip() for l in text.splitlines()]
-    clean = "\n".join(l for l in lines if l)
-
-    # Truncate so model doesn’t drown
-    clean = clean[:12000]
-
-    WEB_CACHE[url] = clean
-    save_cache(WEB_CACHE)
-    return clean
-
-
-    if use_cache and url in cache:
-        return cache[url]
-
-    r = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
-    r.raise_for_status()
-    text = r.text[:6000]  # hard cap to keep things lightweight
-
-    if use_cache:
-        cache[url] = text
-        save_json(cache_file, cache)
-
-    return text
-
-
-def save_memory(task: str, answer: str, memory_file: str):
-    mem = load_json(memory_file, [])
-    mem.append({"task": task, "answer": answer})
-    save_json(memory_file, mem)
+def truncate(s: str, limit: int) -> str:
+    s = s or ""
+    return s if len(s) <= limit else (s[:limit] + "\n...[truncated]...")
 
 
 # =========================
-# Tool parsing (whitespace tolerant)
+# Tool parsing
 # Accepts:
 #   TOOL:web_get(https://example.com)
 #   TOOL:web_get(url=https://example.com)
+#   TOOL:web_get("https://example.com")
 #   TOOL:web_get( url = https://example.com )
 # =========================
 TOOL_WEB_GET_RE = re.compile(
@@ -336,26 +138,130 @@ def parse_web_get_call(text: str):
     return normalize_url(arg)
 
 
-def truncate(s: str, limit: int) -> str:
-    s = s or ""
-    if len(s) <= limit:
-        return s
-    return s[:limit] + "\n...[truncated]..."
+# =========================
+# HTML cleanup (optional)
+# =========================
+def looks_like_html(s: str) -> bool:
+    if not s:
+        return False
+    head = s.lstrip()[:200].lower()
+    return "<html" in head or "<!doctype" in head or "<head" in head
+
+
+def html_to_structured_text(html: str, base_url: str, max_chars: int = 12000) -> str:
+    """
+    If bs4 is installed, strip scripts/styles and return readable text.
+    If not installed, return a truncated raw string.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        return truncate(html, max_chars)
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        try:
+            tag.decompose()
+        except Exception:
+            pass
+
+    text = soup.get_text(separator="\n")
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    clean = "\n".join(lines)
+    return truncate(clean, max_chars)
+
+
+# =========================
+# Web tool (with cache + retries)
+# =========================
+def web_get_with_retries(url: str, timeout: int = 20, retries: int = 3, backoff: float = 0.7, headers=None):
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers or {"User-Agent": USER_AGENT})
+            r.raise_for_status()
+            return r.text, None
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                sleep_s = backoff * (2 ** (attempt - 1)) + random.random() * 0.2
+                time.sleep(sleep_s)
+    return None, str(last_err)
+
+
+def web_get(url: str, cache: dict, cache_file: str, use_cache: bool = True) -> str:
+    url = normalize_url(url)
+
+    if use_cache and url in cache:
+        return cache[url]
+
+    html, err = web_get_with_retries(url, timeout=HTTP_TIMEOUT, retries=3, backoff=0.7)
+    if err:
+        raise RuntimeError(err)
+
+    # Convert HTML to readable text if it looks like HTML
+    if looks_like_html(html):
+        text = html_to_structured_text(html, url, max_chars=12000)
+    else:
+        text = truncate(html, 6000)
+
+    if use_cache:
+        cache[url] = text
+        save_json(cache_file, cache)
+
+    return text
+
+
+# =========================
+# Memory
+# =========================
+def save_memory(task: str, answer: str, memory_file: str):
+    mem = load_json(memory_file, [])
+    mem.append({"task": task, "answer": answer})
+    save_json(memory_file, mem)
+
+
+# =========================
+# FINAL detection
+# =========================
+FINAL_LINE_RE = re.compile(
+    r"(?m)^(?:Task:\s*)?(FINAL(?: ANSWER)?):\s*(.*)$"
+)
+
+
+def extract_final_body(reply: str):
+    """
+    Finds a line starting with FINAL: or FINAL ANSWER: (optionally prefixed by 'Task: ').
+    Returns (marker, body) or (None, None).
+    Body includes:
+      - any text on the same line after the colon
+      - plus all following lines
+    """
+    m = FINAL_LINE_RE.search(reply or "")
+    if not m:
+        return None, None
+
+    marker = m.group(1)  # FINAL or FINAL ANSWER
+    rest_same_line = m.group(2) or ""
+
+    tail = (reply or "")[m.end():]
+    # If there is content after marker on the same line, include it first
+    pieces = []
+    if rest_same_line.strip():
+        pieces.append(rest_same_line.strip())
+    if tail:
+        # drop one leading newline if present
+        tail = tail[1:] if tail.startswith("\n") else tail
+        pieces.append(tail)
+
+    body = "\n".join(pieces).strip()
+    return marker, body
 
 
 # =========================
 # Agent loop
 # =========================
-
-# ======================
-# CONFIDENCE STOP HELPERS
-# ======================
-
-def has_enough_bullets(text: str, n: int = 2) -> bool:
-    bullets = [l for l in text.splitlines() if l.strip().startswith("- ")]
-    return len(bullets) >= n
-
-
 def run(task: str, *, client: OpenAI, model: str, debug: bool,
         max_steps: int, max_tool_calls: int,
         cache_file: str, memory_file: str, use_cache: bool,
@@ -375,10 +281,12 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             "content": "PAST MEMORY (for context):\n" + json.dumps(tail, indent=2)
         })
 
-    # Option A: enforce tool usage if user requests it
     must_use_tool = "must use the tool" in (task or "").lower()
     tool_calls_used = 0
     used_urls = set()
+
+    # bullet requirement: from task if present, else default 2
+    required_bullets = required_bullets_from_task(task) or 2
 
     messages.append({"role": "user", "content": task})
 
@@ -389,9 +297,9 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
         )
         reply = (resp.choices[0].message.content or "").strip()
 
-        # ---- FINAL detection (must be start-of-line) ----
-        # Accept either "FINAL:" or "FINAL ANSWER:" at start of reply.
-        if reply.startswith("FINAL:") or reply.startswith("FINAL ANSWER:") or has_enough_bullets(reply, 2):
+        # ---- FINAL detection ----
+        marker, body = extract_final_body(reply)
+        if marker is not None:
             # If tool was required but never used, block FINAL and force tool usage
             if must_use_tool and tool_calls_used == 0:
                 messages.append({"role": "assistant", "content": reply})
@@ -401,39 +309,82 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
                 })
                 continue
 
-            # Extract answer body
-            if reply.startswith("FINAL ANSWER:"):
-                answer = reply[len("FINAL ANSWER:"):].strip()
-            else:
-                answer = reply[len("FINAL:"):].strip()
+            if count_bullets(body) >= required_bullets:
+                print("\n====================")
+                print("FINAL ANSWER:")
+                print(body)
+                print("====================\n")
+                save_memory(task, body, memory_file)
+                sys.exit(0)
+
+            # Not enough bullets -> force model to continue
+            messages.append({"role": "assistant", "content": reply})
+            messages.append({
+                "role": "system",
+                "content": f"Your FINAL answer must include at least {required_bullets} bullet points (lines starting with '- '). Try again. Output only the final answer."
+            })
+            continue
+
+        # ---- Fallback FINAL: accept bullet-only reply when task requires bullets ----
+        # (Prevents infinite loops when the model complies with bullets but forgets FINAL.)
+        if count_bullets(reply) >= required_bullets:
+            # Reject acknowledgement-only bullets
+            lower = reply.lower()
+            if any(x in lower for x in ["understood", "awaiting", "ready to", "please provide"]):
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({
+                    "role": "system",
+                    "content": "You produced acknowledgement bullets. Provide ACTUAL answers in bullet points. Output only the final answer."
+                })
+                continue
+
+            # If tool was required but never used, block FINAL and force tool usage
+            if must_use_tool and tool_calls_used == 0:
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({
+                    "role": "system",
+                    "content": "You MUST call TOOL:web_get(...) at least once before producing FINAL."
+                })
+                continue
 
             print("\n====================")
             print("FINAL ANSWER:")
-            print(answer)
+            print(reply)
             print("====================\n")
-
-            save_memory(task, answer, memory_file)
-
-            # HARD EXIT to prevent any extra looping
+            save_memory(task, reply, memory_file)
             sys.exit(0)
 
         # ---- Tool parsing ----
         url = parse_web_get_call(reply)
 
-        # If NOT a tool call, print normally (debug shows steps; non-debug still prints)
+        # If NOT a tool call, print normally
         if url is None:
+            # Bootstrap URL from task if model didn't call tool (once)
+            if tool_calls_used == 0:
+                bootstrap_url = extract_url(task) or guess_url(task)
+                if bootstrap_url:
+                    url = bootstrap_url
+                    print(f"\n[bootstrap] web_get -> {url}")
+                    tool_calls_used += 1
+                    used_urls.add(url)
+                    try:
+                        result_full = web_get(url, cache, cache_file, use_cache)
+                    except Exception as e:
+                        result_full = f"Tool error fetching {url}: {e}"
+        
+                    result_for_model = truncate(result_full, tool_result_limit_for_model)
+                    messages.append({"role": "assistant", "content": reply})
+                    messages.append({"role": "user", "content": f"Tool result:\n{result_for_model}"})
+                    continue
             if debug:
                 print(f"\nSTEP {step}:\n{reply}")
             else:
-                # In non-debug, still show assistant progress (optional: comment out if you want quieter)
                 print(f"\nSTEP {step}:\n{reply}")
-
             messages.append({"role": "assistant", "content": reply})
             continue
 
         # ---- Tool call handling ----
         if tool_calls_used >= max_tool_calls:
-            # Prevent infinite tool spam
             messages.append({"role": "assistant", "content": reply})
             messages.append({
                 "role": "system",
@@ -442,7 +393,6 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             continue
 
         if url in used_urls:
-            # Prevent repeat URL calls in multi-hop loops
             messages.append({"role": "assistant", "content": reply})
             messages.append({
                 "role": "system",
@@ -466,15 +416,12 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             result_full = f"Tool error fetching {url}: {e}"
             print(f"\n[tool] web_get -> {url} (error)")
 
-        # Option B: truncate what we feed back to the model
         result_for_model = truncate(result_full, tool_result_limit_for_model)
 
-        # (Optional) debug print a tiny snippet of tool output
         if debug:
             snippet = truncate(result_full, tool_result_limit_for_print)
             print(f"[tool] snippet:\n{snippet}\n")
 
-        # Add messages so model can continue
         messages.append({"role": "assistant", "content": reply})
         messages.append({"role": "user", "content": f"Tool result:\n{result_for_model}"})
 
@@ -483,7 +430,7 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
 
 
 # =========================
-# CLI entrypoint (Upgrade #3)
+# CLI
 # =========================
 def main():
     load_dotenv()
@@ -529,4 +476,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
