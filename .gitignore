@@ -1,18 +1,21 @@
-# Secrets
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+
+# Local state
+memory.json
+
+# macOS
+.DS_Store
 .env
 
-# Python junk
-__pycache__/
-*.pyc
-
-# Agent runtime artifacts
-cache.json
-memory.json
-memory.txt
-
-# Backups
-*.bak
-
-# OS junk
-.DS_Store
-
+# Local scratch
+tools/
+backups/
+backups/
