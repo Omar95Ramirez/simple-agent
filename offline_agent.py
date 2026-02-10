@@ -1,7 +1,11 @@
 import argparse
+import logging
 import requests
 
 from simple_agent.core import extract_url, guess_url, summarize_html
+from simple_agent.logging_utils import setup_logging
+
+logger = logging.getLogger("offline_agent")
 
 SYSTEM = """You are a tiny offline agent.
 You can use one tool:
@@ -14,6 +18,7 @@ Given a task, do:
 """
 
 def web_get(url: str) -> str:
+    logger.info("web_get %s", url)
     r = requests.get(url, timeout=15, headers={"User-Agent": "offline-agent/1.0"})
     r.raise_for_status()
     return r.text[:120000]
@@ -24,20 +29,20 @@ def run(task: str | None):
         task = input("Task: ").strip()
 
     if not task:
-        print("No task provided.")
+        logger.error("No task provided.")
         return
 
     url = extract_url(task) or guess_url(task)
     if not url:
-        print("Could not infer a URL. Please include an https:// link.")
+        logger.error("Could not infer a URL. Please include an https:// link.")
         return
 
-    print(f"\n[Agent] Using web_get({url})")
+    logger.info("Using URL: %s", url)
 
     try:
         html = web_get(url)
     except Exception as e:
-        print(f"[Agent] web_get failed: {e}")
+        logger.exception("web_get failed: %s", e)
         return
 
     print("\n[Agent] Summary:\n")
@@ -47,5 +52,8 @@ def run(task: str | None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", help="Task or prompt")
+    parser.add_argument("--log-level", help="DEBUG|INFO|WARNING|ERROR")
     args = parser.parse_args()
+
+    setup_logging(args.log_level)
     run(args.task)

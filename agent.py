@@ -9,6 +9,10 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from dotenv import load_dotenv
+import logging
+from simple_agent.logging_utils import setup_logging
+logger = logging.getLogger("simple_agent")
+
 from openai import OpenAI
 from simple_agent.core import extract_url, guess_url, summarize_html
 
@@ -377,9 +381,9 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
                     messages.append({"role": "user", "content": f"Tool result:\n{result_for_model}"})
                     continue
             if debug:
-                print(f"\nSTEP {step}:\n{reply}")
+                logger.debug("STEP %s:\n%s", step, reply)
             else:
-                print(f"\nSTEP {step}:\n{reply}")
+                logger.debug("STEP %s:\n%s", step, reply)
             messages.append({"role": "assistant", "content": reply})
             continue
 
@@ -408,13 +412,13 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             was_cached = use_cache and (url in cache)
             result_full = web_get(url, cache, cache_file, use_cache)
             status = " (cache hit)" if was_cached else ""
-            print(f"\n[tool] web_get -> {url}{status}")
+            logger.info("tool web_get %s%s", url, status)
         except KeyboardInterrupt:
             print("\nInterrupted.")
             sys.exit(130)
         except Exception as e:
             result_full = f"Tool error fetching {url}: {e}"
-            print(f"\n[tool] web_get -> {url} (error)")
+            logger.error("tool web_get %s (error)", url)
 
         result_for_model = truncate(result_full, tool_result_limit_for_model)
 
@@ -438,6 +442,7 @@ def main():
     parser = argparse.ArgumentParser(description="Simple tool-using agent")
     parser.add_argument("--model", default=MODEL_DEFAULT)
     parser.add_argument("--debug", action="store_true", help="Print extra debugging output")
+    parser.add_argument("--log-level", help="DEBUG|INFO|WARNING|ERROR")
     parser.add_argument("--no-cache", action="store_true", help="Disable cache.json usage")
     parser.add_argument("--cache-file", default=CACHE_FILE_DEFAULT)
     parser.add_argument("--memory-file", default=MEMORY_FILE_DEFAULT)
@@ -446,6 +451,7 @@ def main():
     parser.add_argument("--tool-result-limit-model", type=int, default=TOOL_RESULT_LIMIT_FOR_MODEL_DEFAULT)
     parser.add_argument("--tool-result-limit-print", type=int, default=TOOL_RESULT_LIMIT_FOR_PRINT_DEFAULT)
     args = parser.parse_args()
+    setup_logging(args.log_level)
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
