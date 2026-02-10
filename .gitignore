@@ -1,0 +1,18 @@
+# Secrets
+.env
+
+# Python junk
+__pycache__/
+*.pyc
+
+# Agent runtime artifacts
+cache.json
+memory.json
+memory.txt
+
+# Backups
+*.bak
+
+# OS junk
+.DS_Store
+xx
