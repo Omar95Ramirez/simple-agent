@@ -11,6 +11,7 @@ import requests
 from dotenv import load_dotenv
 import logging
 from simple_agent.logging_utils import setup_logging
+from simple_agent.tools import register_tool, parse_tool_call, TOOLS
 logger = logging.getLogger("simple_agent")
 
 from openai import OpenAI
@@ -206,7 +207,7 @@ def web_get(url: str, cache: dict, cache_file: str, use_cache: bool = True) -> s
 
     # Convert HTML to readable text if it looks like HTML
     if looks_like_html(html):
-        text = html_to_structured_text(html, url, max_chars=12000)
+        text = html_to_structured_text(html, url, max_chars=120000)
     else:
         text = truncate(html, 6000)
 
@@ -217,9 +218,8 @@ def web_get(url: str, cache: dict, cache_file: str, use_cache: bool = True) -> s
     return text
 
 
-# =========================
-# Memory
-# =========================
+register_tool("web_get", web_get, "Fetch a webpage by URL")
+
 def save_memory(task: str, answer: str, memory_file: str):
     mem = load_json(memory_file, [])
     mem.append({"task": task, "answer": answer})
@@ -359,10 +359,10 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             sys.exit(0)
 
         # ---- Tool parsing ----
-        url = parse_web_get_call(reply)
+        tool_call = parse_tool_call(reply)
 
         # If NOT a tool call, print normally
-        if url is None:
+        if tool_call is None:
             # Bootstrap URL from task if model didn't call tool (once)
             if tool_calls_used == 0:
                 bootstrap_url = extract_url(task) or guess_url(task)
@@ -370,11 +370,11 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
                     url = bootstrap_url
                     print(f"\n[bootstrap] web_get -> {url}")
                     tool_calls_used += 1
-                    used_urls.add(url)
+                    used_urls.add(args)
                     try:
-                        result_full = web_get(url, cache, cache_file, use_cache)
+                        result_full = TOOLS[name].func(args, cache, cache_file, use_cache)
                     except Exception as e:
-                        result_full = f"Tool error fetching {url}: {e}"
+                        result_full = f"Tool error fetching {args}: {e}"
         
                     result_for_model = truncate(result_full, tool_result_limit_for_model)
                     messages.append({"role": "assistant", "content": reply})
@@ -396,7 +396,12 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             })
             continue
 
-        if url in used_urls:
+        name, args = tool_call
+        if name not in TOOLS:
+            messages.append({"role": "system", "content": f"Unknown tool: {name}"})
+            continue
+
+        if args in used_urls:
             messages.append({"role": "assistant", "content": reply})
             messages.append({
                 "role": "system",
@@ -404,21 +409,21 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             })
             continue
 
-        used_urls.add(url)
+        used_urls.add(args)
         tool_calls_used += 1
 
         # Execute tool
         try:
-            was_cached = use_cache and (url in cache)
-            result_full = web_get(url, cache, cache_file, use_cache)
+            was_cached = use_cache and (args in cache)
+            result_full = TOOLS[name].func(args, cache, cache_file, use_cache)
             status = " (cache hit)" if was_cached else ""
-            logger.info("tool web_get %s%s", url, status)
+            logger.info("tool %s %s%s", name, args, status)
         except KeyboardInterrupt:
             print("\nInterrupted.")
             sys.exit(130)
         except Exception as e:
-            result_full = f"Tool error fetching {url}: {e}"
-            logger.error("tool web_get %s (error)", url)
+            result_full = f"Tool error fetching {args}: {e}"
+            logger.error("tool %s %s (error)", name, args)
 
         result_for_model = truncate(result_full, tool_result_limit_for_model)
 
