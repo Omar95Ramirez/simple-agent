@@ -1,3 +1,24 @@
+SYSTEM_PROMPT = """
+You are an autonomous CLI agent.
+
+If you need to call a tool, output EXACTLY one line in this format:
+
+TOOL {"name":"tool_name","args":{...}}
+
+Rules:
+
+- The TOOL line must be plain text (no markdown).
+- One TOOL call per line.
+- Do NOT wrap TOOL lines in code blocks.
+- Do NOT add explanation on the same line.
+- After receiving TOOL_RESULT, continue normally.
+
+Available tools:
+- web_get: { "url": string }
+
+Prefer JSON TOOL syntax. Legacy TOOL:name(...) is supported but discouraged.
+"""
+
 import os
 import sys
 import json
@@ -275,7 +296,7 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
     cache = load_json(cache_file, {})
     past_memory = load_json(memory_file, [])
 
-    messages = [{"role": "system", "content": SYSTEM}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     # Keep prompt small: include last ~10 memories
     if past_memory:
@@ -366,26 +387,22 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             # Bootstrap URL from task if model didn't call tool (once)
             if tool_calls_used == 0:
                 bootstrap_url = extract_url(task) or guess_url(task)
-                if bootstrap_url:
-                    url = bootstrap_url
-                    print(f"\n[bootstrap] web_get -> {url}")
-                    tool_calls_used += 1
-                    used_urls.add(args)
-                    try:
-                        result_full = TOOLS[name].func(args, cache, cache_file, use_cache)
-                    except Exception as e:
-                        result_full = f"Tool error fetching {args}: {e}"
-        
-                    result_for_model = truncate(result_full, tool_result_limit_for_model)
-                    messages.append({"role": "assistant", "content": reply})
-                    messages.append({"role": "user", "content": f"Tool result:\n{result_for_model}"})
-                    continue
-            if debug:
-                logger.debug("STEP %s:\n%s", step, reply)
-            else:
-                logger.debug("STEP %s:\n%s", step, reply)
-            messages.append({"role": "assistant", "content": reply})
-            continue
+                
+            if bootstrap_url:
+                url = bootstrap_url
+                print(f"\n[bootstrap] web_get -> {url}")
+                tool_calls_used += 1
+                used_urls.add(url)
+                try:
+                    result_full = TOOLS["web_get"].func(url, cache, cache_file, use_cache)
+                except Exception as e:
+                    result_full = f"Tool error fetching {url}: {e}"
+
+                result_for_model = truncate(result_full, tool_result_limit_for_model)
+                messages.append({"role": "assistant", "content": reply})
+                messages.append({"role": "user", "content": f"Tool result:\n{result_for_model}"})
+                continue
+
 
         # ---- Tool call handling ----
         if tool_calls_used >= max_tool_calls:
