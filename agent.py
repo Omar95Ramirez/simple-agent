@@ -441,6 +441,57 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
 # =========================
 # CLI
 # =========================
+# =========================
+# TOOL short-circuit (CLI)
+# =========================
+def maybe_run_user_tool(task: str, *, cache_file: str, use_cache: bool, print_limit: int) -> bool:
+    """
+    If the user types TOOL:web_get(...) or TOOL:<tool>(...), execute locally and exit.
+    Returns True if handled (caller should stop).
+    """
+    t = (task or "").strip()
+
+    # Allow users to paste "Task: ..." by mistake
+    if t.lower().startswith("task:"):
+        t = t.split(":", 1)[1].strip()
+
+    if not t.upper().startswith("TOOL:"):
+        return False
+
+    cache = load_json(cache_file, {})
+
+    # Special-case web_get: TOOL:web_get(<url>) or TOOL:web_get(url=<url>)
+    url = parse_web_get_call(t)
+    if url:
+        try:
+            out = web_get(url, cache, cache_file, use_cache)
+        except Exception as e:
+            out = f"Tool error fetching {url}: {e}"
+        print(truncate(str(out or ""), print_limit))
+        return True
+
+    tool_call = parse_tool_call(t)
+    if not tool_call:
+        print("Invalid TOOL call.")
+        return True
+
+    name, args = tool_call
+    if name not in TOOLS:
+        print(f"Unknown tool: {name}")
+        return True
+
+    fn = TOOLS[name].func
+    try:
+        try:
+            out = fn(args, cache, cache_file, use_cache)
+        except TypeError:
+            out = fn(args)
+    except Exception as e:
+        out = f"Tool error running {name}({args}): {e}"
+
+    print(truncate(str(out or ""), print_limit))
+    return True
+
 def main():
     load_dotenv()
 
@@ -467,6 +518,8 @@ def main():
 
     try:
         task = input("Task: ").strip()
+        if maybe_run_user_tool(task, cache_file=args.cache_file, use_cache=(not args.no_cache), print_limit=args.tool_result_limit_print):
+            sys.exit(0)
         run(
             task,
             client=client,
@@ -487,3 +540,45 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# =========================
+# TOOL short-circuit (CLI)
+# =========================
+def maybe_run_user_tool(task: str, *, cache_file: str, use_cache: bool, print_limit: int) -> bool:
+    t = (task or "").strip()
+    if not t.upper().startswith("TOOL:"):
+        return False
+
+    cache = load_json(cache_file, {})
+
+    # web_get shortcut
+    url = parse_web_get_call(t)
+    if url:
+        try:
+            out = web_get(url, cache, cache_file, use_cache)
+        except Exception as e:
+            out = f"Tool error fetching {url}: {e}"
+        print(truncate(str(out or ""), print_limit))
+        return True
+
+    tool_call = parse_tool_call(t)
+    if not tool_call:
+        print("Invalid TOOL call.")
+        return True
+
+    name, args = tool_call
+    if name not in TOOLS:
+        print(f"Unknown tool: {name}")
+        return True
+
+    fn = TOOLS[name].func
+    try:
+        try:
+            out = fn(args, cache, cache_file, use_cache)
+        except TypeError:
+            out = fn(args)
+    except Exception as e:
+        out = f"Tool error running {name}({args}): {e}"
+
+    print(truncate(str(out or ""), print_limit))
+    return True
