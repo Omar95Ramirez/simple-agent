@@ -1,3 +1,57 @@
+
+def parse_tool_call(reply: str):
+    """
+    Supports:
+      1) New JSON syntax:
+         TOOL {"name":"web_get","args":{"url":"https://example.com"}}
+
+      2) Legacy syntax:
+         TOOL:web_get(https://example.com)
+
+    Returns:
+      None or dict: {"name": str, "args": dict}
+    """
+    import json
+    import re
+
+    if not reply:
+        return None
+
+    # Find the first TOOL line (ignore other text)
+    for line in reply.splitlines():
+        line = line.strip()
+        if not line.startswith("TOOL"):
+            continue
+
+        # JSON syntax: TOOL { ... }
+        # Accept: "TOOL {...}" or "TOOL    {...}"
+        if re.match(r"^TOOL\s+\{", line):
+            payload = line[len("TOOL"):].strip()
+            if not payload:
+                continue
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and "name" in obj:
+                args = obj.get("args", {})
+                if args is None:
+                    args = {}
+                if not isinstance(args, dict):
+                    return None
+                return {"name": obj["name"], "args": args}
+
+        # Legacy syntax: TOOL:web_get(...)
+        m = re.match(r"^TOOL:(?P<name>[a-zA-Z0-9_]+)\((?P<args>.*)\)$", line)
+        if m:
+            name = m.group("name")
+            argstr = m.group("args").strip()
+            # legacy only supports single 'url' argument for web_get
+            return {"name": name, "args": {"url": argstr}}
+
+    return None
+
+
 SYSTEM_PROMPT = """
 You are an autonomous CLI agent.
 
@@ -381,22 +435,17 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
 
         # ---- Tool parsing ----
         tool_call = parse_tool_call(reply)
+        args = (tool_call.get('args', {}) or {}) if tool_call else {}
 
         # If NOT a tool call, print normally
         if tool_call is None:
             # Bootstrap URL from task if model didn't call tool (once)
             if tool_calls_used == 0:
-                bootstrap_url = extract_url(task) or guess_url(task)
-                
-            if bootstrap_url:
-                url = bootstrap_url
-                print(f"\n[bootstrap] web_get -> {url}")
                 tool_calls_used += 1
-                used_urls.add(url)
                 try:
-                    result_full = TOOLS["web_get"].func(url, cache, cache_file, use_cache)
+                    result_full = TOOLS["web_get"].func(args.get("url"), cache, cache_file, use_cache)
                 except Exception as e:
-                    result_full = f"Tool error fetching {url}: {e}"
+                    result_full = f"Tool error fetching {args.get('url')}: {e}"
 
                 result_for_model = truncate(result_full, tool_result_limit_for_model)
                 messages.append({"role": "assistant", "content": reply})
@@ -413,7 +462,13 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             })
             continue
 
-        name, args = tool_call
+        # tool_call is either None or a dict like {'name':..., 'args':...}
+        if not tool_call:
+            messages.append({'role': 'assistant', 'content': reply})
+            continue
+        name = tool_call.get('name')
+        args = tool_call.get('args', {}) or {}
+
         if name not in TOOLS:
             messages.append({"role": "system", "content": f"Unknown tool: {name}"})
             continue
@@ -439,7 +494,7 @@ def run(task: str, *, client: OpenAI, model: str, debug: bool,
             print("\nInterrupted.")
             sys.exit(130)
         except Exception as e:
-            result_full = f"Tool error fetching {args}: {e}"
+            result_full = f"Tool error fetching {args.get('url')}: {e}"
             logger.error("tool %s %s (error)", name, args)
 
         result_for_model = truncate(result_full, tool_result_limit_for_model)
@@ -483,7 +538,7 @@ def maybe_run_user_tool(task: str, *, cache_file: str, use_cache: bool, print_li
         try:
             out = web_get(url, cache, cache_file, use_cache)
         except Exception as e:
-            out = f"Tool error fetching {url}: {e}"
+            result_full = f"Tool error fetching {args.get('url')}: {e}"
         print(truncate(str(out or ""), print_limit))
         return True
 
@@ -492,7 +547,9 @@ def maybe_run_user_tool(task: str, *, cache_file: str, use_cache: bool, print_li
         print("Invalid TOOL call.")
         return True
 
-    name, args = tool_call
+    name = tool_call.get('name')
+    args = tool_call.get('args', {}) or {}
+
     if name not in TOOLS:
         print(f"Unknown tool: {name}")
         return True
@@ -574,7 +631,7 @@ def maybe_run_user_tool(task: str, *, cache_file: str, use_cache: bool, print_li
         try:
             out = web_get(url, cache, cache_file, use_cache)
         except Exception as e:
-            out = f"Tool error fetching {url}: {e}"
+            result_full = f"Tool error fetching {args.get('url')}: {e}"
         print(truncate(str(out or ""), print_limit))
         return True
 
@@ -583,7 +640,12 @@ def maybe_run_user_tool(task: str, *, cache_file: str, use_cache: bool, print_li
         print("Invalid TOOL call.")
         return True
 
-    name, args = tool_call
+    # tool_call is either None or a dict like {'name':..., 'args':...}
+    if not tool_call:
+        messages.append({'role': 'assistant', 'content': reply})
+    name = tool_call.get('name')
+    args = tool_call.get('args', {}) or {}
+
     if name not in TOOLS:
         print(f"Unknown tool: {name}")
         return True
